@@ -126,4 +126,3 @@ Keep the S3 bucket/prefix private and have your backend mint short-lived pre-sig
 
 - Example FastAPI service: `presign_api` (see `presign_api/README.md`)
 - Mobile app flow: call backend → receive URL → download from S3 (no AWS keys on device)
-# hf-s3-model-mirror

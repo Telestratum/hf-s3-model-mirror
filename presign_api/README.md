@@ -8,6 +8,24 @@ This is a minimal FastAPI app that returns short-lived S3 pre-signed URLs for do
 - Never ship AWS credentials to the mobile app.
 - Your backend uses its IAM role to mint pre-signed URLs.
 
+## Models Available
+
+The service provides access to two types of models:
+
+### STT Language Models
+- **Path**: `models/indicconformer/{lang}/`
+- **Languages**: Hindi (`hi`), Tamil (`ta`), Kannada (`kn`), Telugu (`te`), Malayalam (`ml`)
+- **Format**: Single `.nemo` file per language
+
+### LLM Models
+- **Android (Gemma 3 1B)**: `models/llm/android/gemma3-1b/gemma3-1b-it-int4.task`
+  - Single `.task` file (~1GB)
+  - MediaPipe format
+  
+- **iOS (Qwen 2.5 0.5B)**: `models/llm/ios/qwen2.5-0.5b/`
+  - Multiple files (`.safetensors`, config files)
+  - MLX format
+
 ## Run locally
 
 ```bash
@@ -15,33 +33,180 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r presign_api/requirements.txt
 
-export AWS_REGION=us-east-1
-export AWS_PROFILE=your-profile   # optional
-export X_API_KEY=change-me        # optional (see env vars below)
+export AWS_REGION=ap-south-1
+export AWS_PROFILE=your-profile   # optional (see AWS credentials below)
+export API_KEY=change-me          # optional (see env vars below)
 
 uvicorn presign_api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+## AWS Credentials
+
+The service needs AWS credentials to generate pre-signed URLs. Configure using one of these methods:
+
+### Option 1: AWS Profile (recommended for local development)
+
+```bash
+# List available profiles
+aws configure list-profiles
+
+# Set profile for the session
+export AWS_PROFILE=your-profile-name
+```
+
+### Option 2: AWS Access Keys (for environments without profiles)
+
+```bash
+export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+export AWS_REGION=ap-south-1
+```
+
+**Security Note**: Never commit access keys to version control. Use environment variables or `.env` files (which are gitignored).
+
+### Option 3: IAM Role (recommended for production/EC2)
+
+Best practice for production: attach an instance profile/role with permissions:
+
+- `s3:GetObject` on `arn:aws:s3:::glycosense-models-v1/models/indicconformer/*`
+- `s3:GetObject` on `arn:aws:s3:::glycosense-models-v1/models/llm/*`
+
+Then you do not need static access keys on the server. boto3 will automatically use the instance role.
+
+### Option 4: .env file (local development)
+
+Create a `.env` file in the `presign_api/` directory:
+
+```bash
+AWS_REGION=ap-south-1
+AWS_PROFILE=your-profile
+# OR
+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+
+API_KEY=change-me
 ```
 
 ## Environment variables
 
 - `S3_BUCKET` (default: `glycosense-models-v1`)
 - `S3_PREFIX_BASE` (default: `models/indicconformer`)
+- `S3_LLM_PREFIX_BASE` (default: `models/llm`)
 - `PRESIGN_TTL_SECONDS` (default: `900`)
 - `API_KEY` (default: empty = auth disabled)
 
 If `API_KEY` is set, clients must pass header `X-API-Key: <value>`.
 
-## Endpoint
+## Endpoints
 
-- `GET /v1/models` lists available `lang` values and S3 keys
-- `GET /v1/models/{lang}` returns a pre-signed URL, where `lang` is one of: `hi`, `ta`, `kn`, `te`, `ml`
+### STT Language Models
 
-Response includes `url` and `expires_at`.
+- **`GET /v1/models`** - List all available STT language models
+  
+  Response:
+  ```json
+  {
+    "bucket": "glycosense-models-v1",
+    "prefix_base": "models/indicconformer",
+    "models": [
+      {
+        "lang": "hi",
+        "bucket": "glycosense-models-v1",
+        "key": "models/indicconformer/hi/indicconformer_stt_hi_hybrid_rnnt_large.nemo"
+      }
+    ]
+  }
+  ```
 
-## Deploy on EC2
+- **`GET /v1/models/{lang}`** - Get pre-signed URL for specific language
+  
+  Where `lang` is one of: `hi`, `ta`, `kn`, `te`, `ml`
+  
+  Response:
+  ```json
+  {
+    "bucket": "glycosense-models-v1",
+    "key": "models/indicconformer/hi/indicconformer_stt_hi_hybrid_rnnt_large.nemo",
+    "url": "https://glycosense-models-v1.s3.amazonaws.com/...",
+    "expires_at": "2026-01-30T12:00:00+00:00"
+  }
+  ```
 
-Best practice: attach an instance profile/role with permission:
+### LLM Models
 
-- `s3:GetObject` on `arn:aws:s3:::<bucket>/models/indicconformer/*`
+- **`GET /v1/llm-models`** - List all available LLM models
+  
+  Response:
+  ```json
+  {
+    "bucket": "glycosense-models-v1",
+    "prefix_base": "models/llm",
+    "models": [
+      {
+        "os": "android",
+        "model_name": "gemma3-1b",
+        "bucket": "glycosense-models-v1",
+        "key": "models/llm/android/gemma3-1b/gemma3-1b-it-int4.task",
+        "is_directory": false
+      },
+      {
+        "os": "ios",
+        "model_name": "qwen2.5-0.5b",
+        "bucket": "glycosense-models-v1",
+        "key": "models/llm/ios/qwen2.5-0.5b/",
+        "is_directory": true
+      }
+    ]
+  }
+  ```
 
-Then you do not need static access keys on the server.
+- **`GET /v1/llm-models/{os}/{model_name}`** - Get pre-signed URL for specific LLM model
+  
+  Where:
+  - `os` is one of: `android`, `ios`
+  - `model_name` is one of: `gemma3-1b` (Android), `qwen2.5-0.5b` (iOS)
+  
+  Examples:
+  - `GET /v1/llm-models/android/gemma3-1b` - Returns presigned URL for single file
+  - `GET /v1/llm-models/ios/qwen2.5-0.5b` - Returns directory info (client must list objects)
+  
+  Response for single file (Android):
+  ```json
+  {
+    "bucket": "glycosense-models-v1",
+    "key": "models/llm/android/gemma3-1b/gemma3-1b-it-int4.task",
+    "url": "https://glycosense-models-v1.s3.amazonaws.com/...",
+    "expires_at": "2026-01-30T12:00:00+00:00",
+    "is_directory": false
+  }
+  ```
+  
+  Response for directory (iOS):
+  ```json
+  {
+    "bucket": "glycosense-models-v1",
+    "key": "models/llm/ios/qwen2.5-0.5b/",
+    "url": "https://glycosense-models-v1.s3.amazonaws.com/models/llm/ios/qwen2.5-0.5b/",
+    "expires_at": "2026-01-30T12:00:00+00:00",
+    "is_directory": true
+  }
+  ```
+
+## Example Usage
+
+```bash
+# List STT models
+curl http://localhost:8000/v1/models
+
+# Get presigned URL for Hindi STT model
+curl http://localhost:8000/v1/models/hi
+
+# List LLM models
+curl http://localhost:8000/v1/llm-models
+
+# Get presigned URL for Android Gemma model
+curl http://localhost:8000/v1/llm-models/android/gemma3-1b
+
+# With authentication
+curl -H "X-API-Key: change-me" http://localhost:8000/v1/llm-models/ios/qwen2.5-0.5b
+```
