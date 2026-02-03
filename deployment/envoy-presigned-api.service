@@ -1,0 +1,34 @@
+[Unit]
+Description=Envoy Proxy for Presign API Service
+Documentation=https://www.envoyproxy.io/
+After=network.target
+Wants=network.target
+Requires=presign-api.service
+After=presign-api.service
+
+[Service]
+Type=simple
+User=envoy
+Group=envoy
+ExecStartPre=/usr/bin/envoy --version
+ExecStart=/usr/bin/envoy -c /etc/envoy/envoy-presigned-api.yaml --service-cluster presign-api --service-node envoy-presign-api --log-level info
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=envoy-presign-api
+
+# Security settings
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/envoy
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

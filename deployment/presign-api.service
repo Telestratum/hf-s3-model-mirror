@@ -1,0 +1,27 @@
+[Unit]
+Description=Presign API Service - S3 Pre-signed URL Generator
+After=network.target
+Documentation=https://github.com/your-org/hf-s3-model-mirror
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/presign-api
+Environment="PATH=/opt/presign-api/.venv/bin"
+ExecStart=/opt/presign-api/.venv/bin/uvicorn presign_api.main:app --host 127.0.0.1 --port 3060 --workers 2
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=presign-api
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/presign-api
+
+[Install]
+WantedBy=multi-user.target
