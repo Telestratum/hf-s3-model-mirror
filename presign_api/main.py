@@ -312,15 +312,14 @@ def _model_key(lang: Language) -> str:
 def _llm_model_key(os: OS, model: ModelName) -> str:
     # LLM model key mapping for models/llm/{os}/{model}/
     # Android: models/llm/android/gemma3-1b/gemma3-1b-it-int4.task
-    # iOS: models/llm/ios/qwen2.5-0.5b/ (directory with multiple files)
+    # iOS: models/llm/ios/qwen2.5-0.5b/qwen2.5-0.5b.zip
     prefix = settings.s3_llm_prefix_base.strip("/")
-    
+
     if os == "android" and model == "gemma3-1b":
         return f"{prefix}/{os}/{model}/gemma3-1b-it-int4.task"
     elif os == "ios" and model == "qwen2.5-0.5b":
-        # For MLX models, we return the prefix - client needs to list/download all files
-        return f"{prefix}/{os}/{model}/"
-    
+        return f"{prefix}/{os}/{model}/qwen2.5-0.5b.zip"
+
     raise ValueError(f"Unknown model configuration: {os}/{model}")
 
 
@@ -341,7 +340,6 @@ class LLMModelInfo(BaseModel):
     model_name: ModelName
     bucket: str
     key: str
-    is_directory: bool  # True for iOS/MLX models (multiple files)
 
 
 class LLMModelsResponse(BaseModel):
@@ -355,7 +353,6 @@ class PresignResponse(BaseModel):
     key: str
     url: str
     expires_at: str
-    is_directory: bool = False  # True for MLX models
 
 
 @app.get("/downloader/v1/models/{lang}", response_model=PresignResponse)
@@ -401,7 +398,6 @@ def presign_llm_model_download(
         )
 
     key = _llm_model_key(os, model_name)
-    is_directory = os == "ios"  # iOS/MLX models are directories
 
     # Create S3 client with explicit credentials from settings
     s3 = boto3.client(
@@ -411,37 +407,22 @@ def presign_llm_model_download(
         aws_secret_access_key=settings.aws_secret_access_key,
     )
 
-    if is_directory:
-        # For directory (MLX models), return presigned URL for the prefix listing
-        # Clients should use this to list all files in the directory
-        # Note: S3 doesn't have "directory" presigned URLs, so we'll return the prefix
-        # and indicate it's a directory. Clients need to list objects with this prefix.
-        return PresignResponse(
-            bucket=settings.s3_bucket,
-            key=key,
-            url=f"https://{settings.s3_bucket}.s3.amazonaws.com/{key}",
-            expires_at=datetime.now(timezone.utc).isoformat(),
-            is_directory=True,
+    try:
+        url = s3.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": settings.s3_bucket, "Key": key},
+            ExpiresIn=settings.presign_ttl_seconds,
         )
-    else:
-        # Single file (Android Gemma)
-        try:
-            url = s3.generate_presigned_url(
-                ClientMethod="get_object",
-                Params={"Bucket": settings.s3_bucket, "Key": key},
-                ExpiresIn=settings.presign_ttl_seconds,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to generate presigned URL: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate presigned URL: {e}")
 
-        expires_at = datetime.now(timezone.utc).timestamp() + settings.presign_ttl_seconds
-        return PresignResponse(
-            bucket=settings.s3_bucket,
-            key=key,
-            url=url,
-            expires_at=datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
-            is_directory=False,
-        )
+    expires_at = datetime.now(timezone.utc).timestamp() + settings.presign_ttl_seconds
+    return PresignResponse(
+        bucket=settings.s3_bucket,
+        key=key,
+        url=url,
+        expires_at=datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
+    )
 
 
 @app.get("/downloader/v1/llm-models", response_model=LLMModelsResponse)
@@ -455,7 +436,6 @@ def list_llm_models(_claims: dict = Depends(_require_auth)) -> LLMModelsResponse
                     model_name=model_name,
                     bucket=settings.s3_bucket,
                     key=_llm_model_key(os, model_name),
-                    is_directory=os == "ios",
                 )
             )
     
