@@ -5,6 +5,7 @@ import fnmatch
 import hashlib
 import os
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -21,6 +22,8 @@ class Args:
     dry_run: bool
     keep_local: bool
     local_dir: Optional[str]
+    zip_name: Optional[str]
+    force: bool
 
 
 def _require_env(name: str) -> str:
@@ -111,6 +114,14 @@ def _normalize_bucket(bucket: str) -> str:
     return bucket
 
 
+def _s3_key_exists(s3, bucket: str, key: str) -> bool:
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except s3.exceptions.ClientError:
+        return False
+
+
 def parse_args(argv: list[str]) -> Args:
     p = argparse.ArgumentParser(description="Mirror a Hugging Face model repo (gated OK) into S3")
     p.add_argument("--repo", required=True, help="Hugging Face repo id, e.g. ai4bharat/indicconformer_stt_hi_hybrid_ctc_rnnt_large")
@@ -134,6 +145,19 @@ def parse_args(argv: list[str]) -> Args:
         default=None,
         help="Optional local directory to store/download the snapshot. If omitted, uses HF cache.",
     )
+    p.add_argument(
+        "--zip",
+        dest="zip_name",
+        default=None,
+        metavar="FILENAME",
+        help="Instead of uploading individual files, create a zip archive and upload it. "
+        "Value is the zip filename, e.g. 'qwen2.5-0.5b.zip'. Uploaded to <prefix>/<FILENAME>.",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Upload even if the target already exists in S3. Without this flag, existing files are skipped.",
+    )
 
     ns = p.parse_args(argv)
     return Args(
@@ -146,6 +170,8 @@ def parse_args(argv: list[str]) -> Args:
         dry_run=ns.dry_run,
         keep_local=ns.keep_local,
         local_dir=ns.local_dir,
+        zip_name=ns.zip_name,
+        force=ns.force,
     )
 
 
@@ -172,26 +198,7 @@ def main(argv: list[str]) -> int:
         )
         return 4
 
-    # Quick auth check (fail fast for gated repos)
-    api = HfApi(token=hf_token)
-    try:
-        api.model_info(args.repo, revision=args.revision)
-    except Exception as e:
-        print(f"ERROR: Unable to access repo '{args.repo}' (revision={args.revision}): {e}", file=sys.stderr)
-        return 3
-
-    print(f"Downloading snapshot: {args.repo}@{args.revision}")
-    snapshot_path = snapshot_download(
-        repo_id=args.repo,
-        revision=args.revision,
-        token=hf_token,
-        local_dir=args.local_dir,
-        local_dir_use_symlinks=False,
-        # We filter ourselves because HF's allow_patterns/ignore_patterns are a bit different,
-        # and we want predictable relpaths for S3 keys.
-    )
-    root = Path(snapshot_path)
-
+    # ── Set up S3 early so we can check for existing files before downloading. ──
     region_name = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
     profile_name = os.getenv("AWS_PROFILE") or os.getenv("AWS_DEFAULT_PROFILE")
     session = boto3.session.Session(region_name=region_name, profile_name=profile_name)
@@ -226,39 +233,110 @@ def main(argv: list[str]) -> int:
 
     s3 = session.client("s3")
 
-    planned = 0
-    uploaded = 0
+    # ── Skip if target already exists in S3 (unless --force). ──
+    if not args.force and not args.dry_run and args.zip_name:
+        zip_key = _s3_key(args.prefix, args.zip_name)
+        if _s3_key_exists(s3, bucket_name, zip_key):
+            print(f"SKIP: s3://{bucket_name}/{zip_key} already exists. Use --force to re-upload.")
+            return 0
 
+    # ── Download from Hugging Face. ──
+    # Quick auth check (fail fast for gated repos)
+    api = HfApi(token=hf_token)
+    try:
+        api.model_info(args.repo, revision=args.revision)
+    except Exception as e:
+        print(f"ERROR: Unable to access repo '{args.repo}' (revision={args.revision}): {e}", file=sys.stderr)
+        return 3
+
+    print(f"Downloading snapshot: {args.repo}@{args.revision}")
+    snapshot_path = snapshot_download(
+        repo_id=args.repo,
+        revision=args.revision,
+        token=hf_token,
+        local_dir=args.local_dir,
+        local_dir_use_symlinks=False,
+        # We filter ourselves because HF's allow_patterns/ignore_patterns are a bit different,
+        # and we want predictable relpaths for S3 keys.
+    )
+    root = Path(snapshot_path)
+
+    # Collect files that pass include/exclude filters.
+    matched_files: list[tuple[Path, str]] = []  # (absolute_path, rel_posix)
     for file_path in _iter_files(root):
         rel_posix = file_path.relative_to(root).as_posix()
-        if not _should_upload(rel_posix, args.include, args.exclude):
-            continue
+        if _should_upload(rel_posix, args.include, args.exclude):
+            matched_files.append((file_path, rel_posix))
 
-        key = _s3_key(args.prefix, rel_posix)
-        planned += 1
+    if args.zip_name:
+        # -- Zip mode: bundle matched files into a single archive and upload it.
+        zip_key = _s3_key(args.prefix, args.zip_name)
 
         if args.dry_run:
-            print(f"DRY-RUN upload s3://{bucket_name}/{key}  <-  {rel_posix}")
-            continue
+            print(f"DRY-RUN zip → s3://{bucket_name}/{zip_key}  ({len(matched_files)} file(s))")
+            for _, rel in matched_files:
+                print(f"  {rel}")
+        else:
+            zip_path = root / args.zip_name
+            print(f"Creating zip ({len(matched_files)} files): {zip_path.name}")
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
+                for file_path, rel_posix in matched_files:
+                    zf.write(file_path, arcname=rel_posix)
 
-        sha256 = _sha256_file(file_path)
+            zip_sha256 = _sha256_file(zip_path)
+            zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
+            print(f"Uploading s3://{bucket_name}/{zip_key} ({zip_size_mb:.1f} MB)")
+            s3.upload_file(
+                Filename=str(zip_path),
+                Bucket=bucket_name,
+                Key=zip_key,
+                ExtraArgs={
+                    "Metadata": {
+                        "hf_repo": args.repo,
+                        "hf_revision": args.revision,
+                        "sha256": zip_sha256,
+                    }
+                },
+            )
+            zip_path.unlink()
+            print(f"Done. uploaded=1 (zip with {len(matched_files)} files)")
+    else:
+        # -- Normal mode: upload each file individually.
+        planned = 0
+        uploaded = 0
+        skipped = 0
 
-        print(f"Uploading s3://{bucket_name}/{key}")
-        s3.upload_file(
-            Filename=str(file_path),
-            Bucket=bucket_name,
-            Key=key,
-            ExtraArgs={
-                "Metadata": {
-                    "hf_repo": args.repo,
-                    "hf_revision": args.revision,
-                    "sha256": sha256,
-                }
-            },
-        )
-        uploaded += 1
+        for file_path, rel_posix in matched_files:
+            key = _s3_key(args.prefix, rel_posix)
+            planned += 1
 
-    print(f"Done. planned={planned} uploaded={uploaded} dry_run={args.dry_run}")
+            if args.dry_run:
+                print(f"DRY-RUN upload s3://{bucket_name}/{key}  <-  {rel_posix}")
+                continue
+
+            if not args.force and _s3_key_exists(s3, bucket_name, key):
+                print(f"SKIP (exists): s3://{bucket_name}/{key}")
+                skipped += 1
+                continue
+
+            sha256 = _sha256_file(file_path)
+
+            print(f"Uploading s3://{bucket_name}/{key}")
+            s3.upload_file(
+                Filename=str(file_path),
+                Bucket=bucket_name,
+                Key=key,
+                ExtraArgs={
+                    "Metadata": {
+                        "hf_repo": args.repo,
+                        "hf_revision": args.revision,
+                        "sha256": sha256,
+                    }
+                },
+            )
+            uploaded += 1
+
+        print(f"Done. planned={planned} uploaded={uploaded} skipped={skipped} dry_run={args.dry_run}")
 
     # snapshot_download may return a path in the global HF cache; we won't delete it.
     # If user provided --local-dir, they control lifecycle of that folder.
