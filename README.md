@@ -65,6 +65,33 @@ python3 mirror.py \
   --prefix models/indicconformer/hi/
 ```
 
+### Mirror as a zip archive (single file upload)
+
+Instead of uploading individual files, bundle them into a zip and upload that:
+
+```bash
+python3 mirror.py \
+  --repo mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+  --bucket your-bucket \
+  --prefix models/llm/ios/qwen2.5-0.5b/ \
+  --zip "qwen2.5-0.5b.zip"
+```
+
+This uploads a single `<prefix>/qwen2.5-0.5b.zip` to S3 instead of many individual files.
+
+### Skip existing files / force re-upload
+
+By default, `mirror.py` checks S3 before uploading and skips files that already exist. Use `--force` to re-upload regardless:
+
+```bash
+python3 mirror.py \
+  --repo mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+  --bucket your-bucket \
+  --prefix models/llm/ios/qwen2.5-0.5b/ \
+  --zip "qwen2.5-0.5b.zip" \
+  --force
+```
+
 ### Dry run (prints what would be uploaded)
 
 ```bash
@@ -74,6 +101,18 @@ python3 mirror.py \
   --prefix models/indicconformer/hi/ \
   --dry-run
 ```
+
+### Mirror LLM models (Android + iOS)
+
+The `mirror_llm_models.sh` script handles both Android (Gemma) and iOS (Qwen) models:
+
+```bash
+./mirror_llm_models.sh              # mirror all models
+./mirror_llm_models.sh android      # Gemma for Android only
+./mirror_llm_models.sh ios          # Qwen for iOS only
+```
+
+Both paths skip the download/upload if the target already exists in S3.
 
 ## Minimal IAM policy example
 
@@ -87,6 +126,7 @@ Scope this down to your bucket/prefix.
       "Effect": "Allow",
       "Action": [
         "s3:PutObject",
+        "s3:GetObject",
         "s3:AbortMultipartUpload",
         "s3:ListBucket",
         "s3:GetBucketLocation"
@@ -110,13 +150,18 @@ Scope this down to your bucket/prefix.
 
 ## Output layout recommendation
 
-Use a stable prefix per locale:
+**Speech models** – one prefix per locale:
 
 - `s3://<bucket>/models/indicconformer/hi/`
 - `s3://<bucket>/models/indicconformer/ta/`
 - `s3://<bucket>/models/indicconformer/kn/`
 - `s3://<bucket>/models/indicconformer/te/`
 - `s3://<bucket>/models/indicconformer/ml/`
+
+**LLM models** – one file per OS/model:
+
+- `s3://<bucket>/models/llm/android/gemma3-1b/gemma3-1b-it-int4.task`
+- `s3://<bucket>/models/llm/ios/qwen2.5-0.5b/qwen2.5-0.5b.zip`
 
 This keeps the mobile-side mapping trivial.
 
