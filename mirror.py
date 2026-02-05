@@ -265,6 +265,9 @@ def main(argv: list[str]) -> int:
     # Collect files that pass include/exclude filters.
     matched_files: list[tuple[Path, str]] = []  # (absolute_path, rel_posix)
     for file_path in _iter_files(root):
+        # Skip stale zip archives left in the snapshot dir by previous runs.
+        if args.zip_name and file_path.name == args.zip_name:
+            continue
         rel_posix = file_path.relative_to(root).as_posix()
         if _should_upload(rel_posix, args.include, args.exclude):
             matched_files.append((file_path, rel_posix))
