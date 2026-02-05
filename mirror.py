@@ -5,6 +5,7 @@ import fnmatch
 import hashlib
 import os
 import sys
+import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -277,29 +278,32 @@ def main(argv: list[str]) -> int:
             for _, rel in matched_files:
                 print(f"  {rel}")
         else:
-            zip_path = root / args.zip_name
-            print(f"Creating zip ({len(matched_files)} files): {zip_path.name}")
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
-                for file_path, rel_posix in matched_files:
-                    zf.write(file_path, arcname=rel_posix)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zip_path = Path(tmpdir) / args.zip_name
+                total = len(matched_files)
+                print(f"Creating zip ({total} files): {args.zip_name}")
+                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
+                    for i, (file_path, rel_posix) in enumerate(matched_files, 1):
+                        size_mb = file_path.stat().st_size / (1024 * 1024)
+                        print(f"  [{i}/{total}] {rel_posix} ({size_mb:.1f} MB)")
+                        zf.write(file_path, arcname=rel_posix)
 
-            zip_sha256 = _sha256_file(zip_path)
-            zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
-            print(f"Uploading s3://{bucket_name}/{zip_key} ({zip_size_mb:.1f} MB)")
-            s3.upload_file(
-                Filename=str(zip_path),
-                Bucket=bucket_name,
-                Key=zip_key,
-                ExtraArgs={
-                    "Metadata": {
-                        "hf_repo": args.repo,
-                        "hf_revision": args.revision,
-                        "sha256": zip_sha256,
-                    }
-                },
-            )
-            zip_path.unlink()
-            print(f"Done. uploaded=1 (zip with {len(matched_files)} files)")
+                zip_sha256 = _sha256_file(zip_path)
+                zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
+                print(f"Uploading s3://{bucket_name}/{zip_key} ({zip_size_mb:.1f} MB)")
+                s3.upload_file(
+                    Filename=str(zip_path),
+                    Bucket=bucket_name,
+                    Key=zip_key,
+                    ExtraArgs={
+                        "Metadata": {
+                            "hf_repo": args.repo,
+                            "hf_revision": args.revision,
+                            "sha256": zip_sha256,
+                        }
+                    },
+                )
+            print(f"Done. uploaded=1 (zip with {total} files)")
     else:
         # -- Normal mode: upload each file individually.
         planned = 0
