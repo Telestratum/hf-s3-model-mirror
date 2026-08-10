@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 import boto3
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -21,12 +21,23 @@ Language = Literal["hi", "ta", "kn", "te", "ml"]
 ALL_LANGS: tuple[Language, ...] = ("hi", "ta", "kn", "te", "ml")
 
 OS = Literal["android", "ios"]
-ModelName = Literal["gemma3-1b", "qwen2.5-0.5b"]
+ModelName = Literal["gemma3-1b", "qwen2.5-0.5b", "gemma4-e4b", "gemma4-e2b"]
 
-# Map OS to model names
+# Map OS to model names. The legacy gemma3-1b/qwen2.5-0.5b entries stay until
+# clients in the field have updated - they still request those keys.
 OS_MODELS: dict[OS, tuple[ModelName, ...]] = {
-    "android": ("gemma3-1b",),
-    "ios": ("qwen2.5-0.5b",),
+    "android": ("gemma3-1b", "gemma4-e4b", "gemma4-e2b"),
+    "ios": ("qwen2.5-0.5b", "gemma4-e4b", "gemma4-e2b"),
+}
+
+Tier = Literal["e4b", "e2b"]
+
+# Largest first - _resolve_tier picks the first tier the device satisfies.
+TIERS: tuple[Tier, ...] = ("e4b", "e2b")
+
+TIER_MODELS: dict[Tier, ModelName] = {
+    "e4b": "gemma4-e4b",
+    "e2b": "gemma4-e2b",
 }
 
 
@@ -51,6 +62,19 @@ class Settings(BaseSettings):
 
     # Pre-signed URL TTL
     presign_ttl_seconds: int = 900
+
+    # On-device model tier policy. Env-overridable so thresholds can be retuned
+    # by restarting the service, without shipping a new app build. The RAM cutoffs
+    # are initial guesses - the resolve decision logs exist to correct them.
+    tier_e4b_min_ram_bytes_android: int = 12 * 1024**3
+    tier_e2b_min_ram_bytes_android: int = 8 * 1024**3
+    tier_e4b_min_ram_bytes_ios: int = 8 * 1024**3
+    tier_e2b_min_ram_bytes_ios: int = 6 * 1024**3
+    ios_min_gpu_family: int = 7  # Apple GPU family 7 = A14+; mirrors the native Metal gate
+    android_required_abi: str = "arm64-v8a"
+    # iOS downloads a zip and extracts it, so it needs the artifact size roughly
+    # twice over plus slack. Applied on both platforms for simplicity.
+    tier_disk_headroom_multiplier: float = 2.5
 
     # JWT authentication (required) - must match auth service
     auth_jwt_secret: str  # Same as AUTH_JWT_SECRET in auth service
@@ -311,16 +335,111 @@ def _model_key(lang: Language) -> str:
 
 def _llm_model_key(os: OS, model: ModelName) -> str:
     # LLM model key mapping for models/llm/{os}/{model}/
-    # Android: models/llm/android/gemma3-1b/gemma3-1b-it-int4.task
-    # iOS: models/llm/ios/qwen2.5-0.5b/qwen2.5-0.5b.zip
+    # Android runs LiteRT-LM and takes the .litertlm file directly.
+    # iOS runs MLX and takes the whole HF repo as a zip.
     prefix = settings.s3_llm_prefix_base.strip("/")
 
-    if os == "android" and model == "gemma3-1b":
-        return f"{prefix}/{os}/{model}/gemma3-1b-it-int4.task"
-    elif os == "ios" and model == "qwen2.5-0.5b":
-        return f"{prefix}/{os}/{model}/qwen2.5-0.5b.zip"
+    if os == "android":
+        if model == "gemma3-1b":
+            return f"{prefix}/{os}/{model}/gemma3-1b-it-int4.task"
+        if model == "gemma4-e4b":
+            return f"{prefix}/{os}/{model}/gemma-4-E4B-it.litertlm"
+        if model == "gemma4-e2b":
+            return f"{prefix}/{os}/{model}/gemma-4-E2B-it.litertlm"
+    elif os == "ios":
+        if model == "qwen2.5-0.5b":
+            return f"{prefix}/{os}/{model}/qwen2.5-0.5b.zip"
+        if model in ("gemma4-e4b", "gemma4-e2b"):
+            return f"{prefix}/{os}/{model}/{model}.zip"
 
     raise ValueError(f"Unknown model configuration: {os}/{model}")
+
+
+def _s3_client():
+    return boto3.client(
+        "s3",
+        region_name=settings.aws_region,
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key,
+    )
+
+
+def _presign(key: str) -> tuple[str, str]:
+    """Generate a pre-signed GET URL for a bucket key.
+
+    Returns (url, expires_at_iso).
+    """
+    s3 = _s3_client()
+
+    try:
+        url = s3.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": settings.s3_bucket, "Key": key},
+            ExpiresIn=settings.presign_ttl_seconds,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate presigned URL: {e}")
+
+    expires_at = datetime.now(timezone.utc).timestamp() + settings.presign_ttl_seconds
+    return url, datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
+
+
+def _object_size(key: str) -> int | None:
+    """Exact object size, so the client can pre-check disk and verify the download.
+
+    Returns None if the object cannot be statted. A tier whose artifact is not in
+    the bucket yet is treated as unavailable rather than as an error, so a partially
+    mirrored bucket degrades to the smaller tier instead of failing every resolve.
+    """
+    try:
+        return _s3_client().head_object(Bucket=settings.s3_bucket, Key=key)["ContentLength"]
+    except Exception as e:
+        logger.warning(f"Could not stat s3://{settings.s3_bucket}/{key}: {e}")
+        return None
+
+
+def _resolve_tier(
+    os: OS,
+    ram_bytes: int,
+    free_disk_bytes: int,
+    gpu_family: int | None,
+    abi: str | None,
+) -> tuple[Tier, int, str] | None:
+    """Pick the largest tier this device can run, or None if it can run none.
+
+    Returns (tier, size_bytes, reason) on success; None means "use cloud inference".
+    """
+    # Hard gates first - these disqualify the device regardless of RAM.
+    if os == "ios":
+        if gpu_family is None or gpu_family < settings.ios_min_gpu_family:
+            return None
+    else:
+        if abi != settings.android_required_abi:
+            return None
+
+    if os == "android":
+        min_ram = {
+            "e4b": settings.tier_e4b_min_ram_bytes_android,
+            "e2b": settings.tier_e2b_min_ram_bytes_android,
+        }
+    else:
+        min_ram = {
+            "e4b": settings.tier_e4b_min_ram_bytes_ios,
+            "e2b": settings.tier_e2b_min_ram_bytes_ios,
+        }
+
+    for tier in TIERS:
+        if ram_bytes < min_ram[tier]:
+            continue
+        size_bytes = _object_size(_llm_model_key(os, TIER_MODELS[tier]))
+        if size_bytes is None:
+            continue
+        needed = int(size_bytes * settings.tier_disk_headroom_multiplier)
+        if free_disk_bytes < needed:
+            continue
+        return tier, size_bytes, f"ram={ram_bytes} disk={free_disk_bytes} needed={needed}"
+
+    return None
 
 
 class ModelInfo(BaseModel):
@@ -355,33 +474,80 @@ class PresignResponse(BaseModel):
     expires_at: str
 
 
+class ResolveResponse(PresignResponse):
+    tier: Tier
+    model_name: ModelName
+    size_bytes: int
+
+
 @app.get("/downloader/v1/models/{lang}", response_model=PresignResponse)
 def presign_model_download(lang: Language, _claims: dict = Depends(_require_auth)) -> PresignResponse:
     key = _model_key(lang)
+    url, expires_at = _presign(key)
 
-    # Create S3 client with explicit credentials from settings
-    s3 = boto3.client(
-        "s3",
-        region_name=settings.aws_region,
-        aws_access_key_id=settings.aws_access_key_id,
-        aws_secret_access_key=settings.aws_secret_access_key,
-    )
-
-    try:
-        url = s3.generate_presigned_url(
-            ClientMethod="get_object",
-            Params={"Bucket": settings.s3_bucket, "Key": key},
-            ExpiresIn=settings.presign_ttl_seconds,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate presigned URL: {e}")
-
-    expires_at = datetime.now(timezone.utc).timestamp() + settings.presign_ttl_seconds
     return PresignResponse(
         bucket=settings.s3_bucket,
         key=key,
         url=url,
-        expires_at=datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
+        expires_at=expires_at,
+    )
+
+
+# NOTE: must be declared before /llm-models/{os}/{model_name}, otherwise FastAPI
+# matches "resolve" as a model_name and rejects it against the ModelName Literal.
+@app.get("/downloader/v1/llm-models/{os}/resolve", response_model=ResolveResponse)
+def resolve_llm_model(
+    os: OS,
+    request: Request,
+    ram_bytes: int,
+    free_disk_bytes: int,
+    gpu_family: int | None = None,
+    abi: str | None = None,
+    os_version: str | None = None,
+    _claims: dict = Depends(_require_auth),
+):
+    """Pick the on-device model tier for a device and return a pre-signed URL for it.
+
+    The tier decision lives here rather than in the app so the thresholds can be
+    retuned without shipping a new build. Returns 204 when the device cannot run
+    any tier - the client treats that as "use cloud inference", not an error.
+    """
+    resolved = _resolve_tier(os, ram_bytes, free_disk_bytes, gpu_family, abi)
+
+    log_context = {
+        "trace_id": getattr(request.state, "trace_id", None),
+        "request_id": getattr(request.state, "request_id", None),
+        "user_id": _claims.get("user_id"),
+    }
+
+    if resolved is None:
+        logger.info(
+            f"Model tier resolve: {os} -> ineligible "
+            f"(ram={ram_bytes} disk={free_disk_bytes} gpu_family={gpu_family} "
+            f"abi={abi} os_version={os_version})",
+            extra=log_context,
+        )
+        return Response(status_code=204)
+
+    tier, size_bytes, reason = resolved
+    model_name = TIER_MODELS[tier]
+    key = _llm_model_key(os, model_name)
+    url, expires_at = _presign(key)
+
+    logger.info(
+        f"Model tier resolve: {os} -> {tier} ({reason} gpu_family={gpu_family} "
+        f"abi={abi} os_version={os_version})",
+        extra=log_context,
+    )
+
+    return ResolveResponse(
+        bucket=settings.s3_bucket,
+        key=key,
+        url=url,
+        expires_at=expires_at,
+        tier=tier,
+        model_name=model_name,
+        size_bytes=size_bytes,
     )
 
 
@@ -398,30 +564,13 @@ def presign_llm_model_download(
         )
 
     key = _llm_model_key(os, model_name)
+    url, expires_at = _presign(key)
 
-    # Create S3 client with explicit credentials from settings
-    s3 = boto3.client(
-        "s3",
-        region_name=settings.aws_region,
-        aws_access_key_id=settings.aws_access_key_id,
-        aws_secret_access_key=settings.aws_secret_access_key,
-    )
-
-    try:
-        url = s3.generate_presigned_url(
-            ClientMethod="get_object",
-            Params={"Bucket": settings.s3_bucket, "Key": key},
-            ExpiresIn=settings.presign_ttl_seconds,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate presigned URL: {e}")
-
-    expires_at = datetime.now(timezone.utc).timestamp() + settings.presign_ttl_seconds
     return PresignResponse(
         bucket=settings.s3_bucket,
         key=key,
         url=url,
-        expires_at=datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
+        expires_at=expires_at,
     )
 
 

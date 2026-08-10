@@ -71,13 +71,13 @@ Instead of uploading individual files, bundle them into a zip and upload that:
 
 ```bash
 python3 mirror.py \
-  --repo mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+  --repo mlx-community/gemma-4-e4b-it-4bit \
   --bucket your-bucket \
-  --prefix models/llm/ios/qwen2.5-0.5b/ \
-  --zip "qwen2.5-0.5b.zip"
+  --prefix models/llm/ios/gemma4-e4b/ \
+  --zip "gemma4-e4b.zip"
 ```
 
-This uploads a single `<prefix>/qwen2.5-0.5b.zip` to S3 instead of many individual files.
+This uploads a single `<prefix>/gemma4-e4b.zip` to S3 instead of many individual files.
 
 ### Skip existing files / force re-upload
 
@@ -85,10 +85,10 @@ By default, `mirror.py` checks S3 before uploading and skips files that already 
 
 ```bash
 python3 mirror.py \
-  --repo mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+  --repo mlx-community/gemma-4-e4b-it-4bit \
   --bucket your-bucket \
-  --prefix models/llm/ios/qwen2.5-0.5b/ \
-  --zip "qwen2.5-0.5b.zip" \
+  --prefix models/llm/ios/gemma4-e4b/ \
+  --zip "gemma4-e4b.zip" \
   --force
 ```
 
@@ -104,15 +104,20 @@ python3 mirror.py \
 
 ### Mirror LLM models (Android + iOS)
 
-The `mirror_llm_models.sh` script handles both Android (Gemma) and iOS (Qwen) models:
+The `mirror_llm_models.sh` script handles Gemma 4 for both platforms, in two size tiers.
+Android takes the LiteRT-LM `.litertlm` file directly; iOS takes the MLX repo zipped.
 
 ```bash
-./mirror_llm_models.sh              # mirror all models
-./mirror_llm_models.sh android      # Gemma for Android only
-./mirror_llm_models.sh ios          # Qwen for iOS only
+./mirror_llm_models.sh                  # mirror everything (4 artifacts)
+./mirror_llm_models.sh android          # both Android tiers
+./mirror_llm_models.sh ios e4b          # iOS E4B only
+./mirror_llm_models.sh all e2b          # both platforms, E2B only
 ```
 
 Both paths skip the download/upload if the target already exists in S3.
+
+The Gemma 4 source repos are **gated** — the `HF_TOKEN` account must have accepted the
+Gemma 4 conditions on Hugging Face before these will download.
 
 ## Minimal IAM policy example
 
@@ -160,8 +165,13 @@ Scope this down to your bucket/prefix.
 
 **LLM models** – one file per OS/model:
 
-- `s3://<bucket>/models/llm/android/gemma3-1b/gemma3-1b-it-int4.task`
-- `s3://<bucket>/models/llm/ios/qwen2.5-0.5b/qwen2.5-0.5b.zip`
+- `s3://<bucket>/models/llm/android/gemma4-e4b/gemma-4-E4B-it.litertlm` (3.66 GB)
+- `s3://<bucket>/models/llm/android/gemma4-e2b/gemma-4-E2B-it.litertlm` (2.59 GB)
+- `s3://<bucket>/models/llm/ios/gemma4-e4b/gemma4-e4b.zip` (~5.15 GB)
+- `s3://<bucket>/models/llm/ios/gemma4-e2b/gemma4-e2b.zip` (~3.55 GB)
+
+The legacy `gemma3-1b/` and `qwen2.5-0.5b/` objects are still served to clients that have
+not updated yet — do not delete them.
 
 This keeps the mobile-side mapping trivial.
 
