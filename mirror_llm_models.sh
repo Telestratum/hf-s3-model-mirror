@@ -40,6 +40,26 @@ BUCKET_ARN="arn:aws:s3:::glycosense-models-v1"
 BUCKET_NAME="glycosense-models-v1"
 PREFIX_BASE="models/llm"
 
+# Scratch space for downloads. These artifacts are 2.6-5.2 GB each, so on a server
+# the working set rarely belongs on the root volume. Set MIRROR_WORK_DIR to put
+# everything - the Android curl target, the iOS snapshot, and the zip staged by
+# mirror.py - on one chosen disk. Defaults to the current directory.
+#
+# Note HF_HOME alone is not enough: it only affects the iOS path, which goes through
+# huggingface_hub. The Android artifacts are fetched with plain curl.
+WORK_DIR="${MIRROR_WORK_DIR:-$PWD}"
+mkdir -p "$WORK_DIR"
+
+if [[ -n "${MIRROR_WORK_DIR:-}" ]]; then
+  # mirror.py stages the zip (uncompressed, so full repo size) in a TemporaryDirectory.
+  # Deliberately overrides any inherited TMPDIR: macOS and most shells already set one,
+  # so honouring it would silently leave the largest single file on the wrong disk.
+  # Set MIRROR_TMPDIR to override.
+  export TMPDIR="${MIRROR_TMPDIR:-$WORK_DIR/tmp}"
+  mkdir -p "$TMPDIR"
+  echo "Using work dir: $WORK_DIR (TMPDIR=$TMPDIR)"
+fi
+
 # tier -> Android (LiteRT-LM) source repo and filename
 android_repo() {
   case "$1" in
@@ -79,7 +99,7 @@ mirror_android() {
   fi
 
   url="https://huggingface.co/${repo}/resolve/main/${filename}"
-  local_file="$filename"
+  local_file="${WORK_DIR}/${filename}"
 
   echo "Downloading ${url}..."
   curl -fL -H "Authorization: Bearer ${HF_TOKEN}" \
@@ -104,11 +124,15 @@ mirror_ios() {
   repo="$(ios_repo "$tier")"
 
   echo "=== iOS ${tier}: ${repo} ==="
+  # --local-dir keeps the snapshot in WORK_DIR instead of the global HF cache, and
+  # is also what lets mirror.py delete it after upload. Without it the snapshot
+  # lands in ~/.cache/huggingface and is never cleaned up (~8.7 GB for both tiers).
   "$PYTHON_BIN" mirror.py \
     --repo "$repo" \
     --bucket "$BUCKET_ARN" \
     --prefix "${PREFIX_BASE}/ios/gemma4-${tier}/" \
-    --zip "gemma4-${tier}.zip"
+    --zip "gemma4-${tier}.zip" \
+    --local-dir "${WORK_DIR}/snapshot-gemma4-${tier}"
 }
 
 case "$TIER" in
