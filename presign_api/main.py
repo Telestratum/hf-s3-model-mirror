@@ -66,10 +66,10 @@ class Settings(BaseSettings):
     # On-device model tier policy. Env-overridable so thresholds can be retuned
     # by restarting the service, without shipping a new app build. The RAM cutoffs
     # are initial guesses - the resolve decision logs exist to correct them.
-    tier_e4b_min_ram_bytes_android: int = 12 * 1024**3
-    tier_e2b_min_ram_bytes_android: int = 8 * 1024**3
-    tier_e4b_min_ram_bytes_ios: int = 8 * 1024**3
-    tier_e2b_min_ram_bytes_ios: int = 6 * 1024**3
+    tier_e4b_min_ram_bytes_android: int = 11 * 1024**3
+    tier_e2b_min_ram_bytes_android: int = 7 * 1024**3
+    tier_e4b_min_ram_bytes_ios: int = 6 * 1024**3
+    tier_e2b_min_ram_bytes_ios: int = 5 * 1024**3
     ios_min_gpu_family: int = 7  # Apple GPU family 7 = A14+; mirrors the native Metal gate
     android_required_abi: str = "arm64-v8a"
     # iOS downloads a zip and extracts it, so it needs the artifact size roughly
